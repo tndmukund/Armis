@@ -2091,13 +2091,15 @@ def capture_scapy(iface, cb, stop, bpf=None):
             pass
 
 
-def run_capture(an, iface, stop, bpf=None, pcap_out=None, errors=None, tap=None):
+def run_capture(an, iface, stop, bpf=None, pcap_out=None, errors=None, tap=None, tap2=None):
     out = PcapOut(pcap_out) if pcap_out else None
 
     def cb(ts, d, link):
         an.process_raw(ts, d, link)
         if tap:
             tap(ts, d)
+        if tap2:
+            tap2(ts, d, link)
         if out:
             out.write(ts, d)
 
@@ -2556,6 +2558,7 @@ class ActiveScanner:
         self.result = {"enabled": False, "devices": 0, "list": [], "subnet": "", "iface": "", "at": 0, "error": ""}
         self.started = False
         self.dead = False
+        self.progress = (0, 0)
         self.wake = threading.Event()
 
     def set_mode(self, mode):
@@ -2602,7 +2605,10 @@ class ActiveScanner:
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
         s.bind((ifc, 0))
         found = {}
-        for ip in net.hosts():
+        hosts_all = list(net.hosts())
+        for n_done, ip in enumerate(hosts_all):
+            if n_done % 16 == 0:
+                self.progress = (n_done, len(hosts_all))
             ips = str(ip)
             if ips == myip:
                 continue
@@ -2649,11 +2655,12 @@ class ActiveScanner:
 
     LITE_PORTS = (80, 443, 502, 102, 44818, 20000, 47808, 4840, 135, 445, 139, 22, 23, 53, 8080, 62078, 8008, 8009, 7000, 49152, 5000)
 
-    def scan_lite(self, net=None):
+    def scan_lite(self, net=None, myip="", stop=None):
         """No root / no raw sockets (a phone in Termux): probe the /24 with short TCP connects. A host that answers OR actively
         refuses is alive. Phones/PCs whose firewall silently drops packets are missed, so this is an ESTIMATE (a lower bound)."""
         import errno
         from concurrent.futures import ThreadPoolExecutor
+        plock = threading.Lock()
         if net is None:
             u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -2665,11 +2672,14 @@ class ActiveScanner:
             finally:
                 u.close()
             net = ipaddress.ip_network(myip + "/24", strict=False)
-        else:
-            myip = ""
+        hosts = [str(h) for h in net.hosts() if str(h) != myip]
+        prog = {"done": 0}
+        self.progress = (0, len(hosts))
 
-        def probe(ip):
+        def probe_one(ip):
             for port in self.LITE_PORTS:
+                if stop is not None and stop.is_set():
+                    return None
                 c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 c.settimeout(0.4)
                 try:
@@ -2682,7 +2692,14 @@ class ActiveScanner:
                     return ip
             return None
 
-        hosts = [str(h) for h in net.hosts() if str(h) != myip]
+        def probe(ip):
+            try:
+                return probe_one(ip)
+            finally:
+                with plock:
+                    prog["done"] += 1
+                    self.progress = (prog["done"], len(hosts))
+
         with ThreadPoolExecutor(max_workers=64) as ex:
             alive = [x for x in ex.map(probe, hosts) if x]
         found = {ip: "" for ip in alive}
@@ -2696,7 +2713,10 @@ class ActiveScanner:
                     pass
         finally:
             us.close()
-        time.sleep(3)   # give Windows time to finish its ARP lookups before the table is read
+        if stop is not None:
+            stop.wait(3.5)
+        else:
+            time.sleep(3)   # give Windows time to finish its ARP lookups before the table is read
         # every connect above makes the OS ask "who has <ip>?", so the ARP table now also lists hosts that hide all TCP ports
         for ip, mac in self._arp_table(net).items():
             if ip != myip:
@@ -2706,6 +2726,84 @@ class ActiveScanner:
         if myip:
             found[myip] = ""
         return "tcp-probe", net, found
+
+    def _publish(self, found, net, ifc, method, names=None):
+        """Add every device found to the inventory and store the result (what the sensor page / central / the GUI show)."""
+        now = time.time()
+        names = names or {}
+        with self.an.lock:
+            for ip, mac in found.items():
+                a = self.an.asset("ip:" + ip, now, ip=ip)
+                a.flags.add("active-scan")
+                if mac:
+                    a.arp_macs[mac] += 1
+                    self.an.mac_ips[mac].add(ip)
+                if names.get(ip) and not a.props.get("hostname"):
+                    a.props["hostname"] = names[ip]
+        lst = [{"ip": ip, "mac": mac, "vendor": mac_vendor(mac) or "", "name": names.get(ip, "")} for ip, mac in
+               sorted(found.items(), key=lambda kv: ipaddress.ip_address(kv[0]))]
+        self.result = {"enabled": True, "devices": len(lst), "list": lst[:300], "subnet": str(net), "iface": ifc,
+                       "method": method, "at": int(now), "error": ""}
+        return lst
+
+    @staticmethod
+    def _names(ips, stop=None, wait=5.0):
+        """Reverse-DNS names for the devices found (best effort, at most `wait` seconds in total)."""
+        from concurrent.futures import ThreadPoolExecutor, wait as fwait
+        out = {}
+        if not ips:
+            return out
+        ex = ThreadPoolExecutor(max_workers=32)
+
+        def one(ip):
+            try:
+                return ip, socket.gethostbyaddr(ip)[0]
+            except Exception:  # noqa
+                return ip, ""
+        futs = [ex.submit(one, ip) for ip in ips]
+        done, _ = fwait(futs, timeout=wait)
+        for f in done:
+            try:
+                ip, nm = f.result()
+                if nm:
+                    out[ip] = nm
+            except Exception:  # noqa
+                pass
+        ex.shutdown(wait=False, cancel_futures=True)
+        return out
+
+    def run_once(self, target, stop=None):
+        """ONE device scan on the network adapter the person chose (GUI). No loop, no repeat.
+        target = {"ip": "192.168.1.23", "prefix": 24, "name": "Wi-Fi", "mac": "aa:bb:..."}.  Returns the list of devices found."""
+        ip = (target.get("ip") or "").strip()
+        if not ip:
+            raise RuntimeError("the chosen network adapter has no IPv4 address")
+        net = ipaddress.ip_network("%s/%d" % (ip, int(target.get("prefix") or 24)), strict=False)
+        if net.prefixlen < 22:
+            net = ipaddress.ip_network("%s/22" % ip, strict=False)     # never more than 1022 addresses
+        self.result = dict(self.result, enabled=True, error="", subnet=str(net))
+        self.progress = (0, 1)
+        found, method, ifc = None, "", target.get("name") or ""
+        if sys.platform.startswith("linux") and target.get("name"):
+            self.iface = target["name"]
+            try:
+                _i, net, found = self.scan()
+                method = "arp"
+            except (PermissionError, FileNotFoundError, AttributeError, RuntimeError, OSError):
+                found = None
+        if found is None:
+            _m, net, found = self.scan_lite(net, myip=ip, stop=stop)
+            method = "tcp-probe + arp table (estimate)"
+        if stop is not None and stop.is_set():
+            raise RuntimeError("scan cancelled")
+        found[ip] = target.get("mac") or found.get(ip, "")
+        self.progress = (1, 1)
+        names = self._names([i for i in found if i != ip], stop)
+        try:
+            names.setdefault(ip, socket.gethostname())
+        except Exception:  # noqa
+            pass
+        return self._publish(found, net, ifc, method, names)
 
     def _loop(self):
         while not self.dead:
@@ -2722,18 +2820,7 @@ class ActiveScanner:
                     ifc, net, found = self.scan_lite()
                 if self.mode != "active" or self.dead:
                     continue
-                now = time.time()
-                with self.an.lock:
-                    for ip, mac in found.items():
-                        a = self.an.asset("ip:" + ip, now, ip=ip)
-                        a.flags.add("active-scan")
-                        if mac:
-                            a.arp_macs[mac] += 1
-                            self.an.mac_ips[mac].add(ip)
-                lst = [{"ip": ip, "mac": mac, "vendor": mac_vendor(mac) or ""} for ip, mac in
-                       sorted(found.items(), key=lambda kv: ipaddress.ip_address(kv[0]))]
-                self.result = {"enabled": True, "devices": len(lst), "list": lst[:300], "subnet": str(net), "iface": ifc,
-                               "method": method, "at": int(now), "error": ""}
+                self._publish(found, net, ifc, method)
             except Exception as e:  # noqa
                 self.result = dict(self.result, enabled=True, error=str(e)[:200], at=int(time.time()))
             self.wake.wait(self.every)
@@ -4984,6 +5071,1349 @@ def run_survey(ns, c, d, interactive, pause):
 
 
 
+# ----------------------------------------------------------------------------------------------
+# WINDOWS APP WINDOW (tkinter). OTSense-Sensor.exe opens THIS instead of a web page: choose the network adapter, Passive or
+# Active, press Start / Stop, watch packets, the device scan and the inventory, test the connection to the server, and export
+# the inventory to files when the server cannot be reached. Nothing runs until Start is pressed and nothing runs after Stop.
+# ----------------------------------------------------------------------------------------------
+
+_VIRTUAL_HINTS = ("vmware", "virtualbox", "hyper-v", "vethernet", "virtual", "loopback", "npcap", "tap-", "wintun", "wsl",
+                  "bluetooth", "vpn", "miniport", "docker", "tailscale", "zerotier")
+
+
+def _dec(b):
+    try:
+        return b.decode("mbcs" if os.name == "nt" else "utf-8", "replace")
+    except LookupError:
+        return b.decode("utf-8", "replace")
+
+
+def _prefix_of(mask):
+    try:
+        return ipaddress.ip_network("0.0.0.0/" + mask).prefixlen
+    except ValueError:
+        return 24
+
+
+def _win_adapters():
+    """Every Windows network adapter with an IPv4 address, from the built-in GetAdaptersInfo call (no PowerShell, no admin)."""
+    import ctypes as C
+
+    class IPS(C.Structure):
+        pass
+    IPS._fields_ = [("Next", C.POINTER(IPS)), ("IpAddress", C.c_char * 16), ("IpMask", C.c_char * 16), ("Context", C.c_ulong)]
+
+    class AI(C.Structure):
+        pass
+    AI._fields_ = [("Next", C.POINTER(AI)), ("ComboIndex", C.c_ulong), ("AdapterName", C.c_char * 260),
+                   ("Description", C.c_char * 132), ("AddressLength", C.c_uint), ("Address", C.c_ubyte * 8),
+                   ("Index", C.c_ulong), ("Type", C.c_uint), ("DhcpEnabled", C.c_uint), ("CurrentIpAddress", C.POINTER(IPS)),
+                   ("IpAddressList", IPS), ("GatewayList", IPS), ("DhcpServer", IPS), ("HaveWins", C.c_int),
+                   ("PrimaryWinsServer", IPS), ("SecondaryWinsServer", IPS), ("LeaseObtained", C.c_ulonglong),
+                   ("LeaseExpires", C.c_ulonglong)]
+    iph = C.windll.iphlpapi
+    size = C.c_ulong(0)
+    iph.GetAdaptersInfo(None, C.byref(size))
+    buf = C.create_string_buffer(max(size.value, 16384))
+    size = C.c_ulong(len(buf))
+    if iph.GetAdaptersInfo(buf, C.byref(size)) != 0:
+        return []
+    out = []
+    p = C.cast(buf, C.POINTER(AI))
+    while p:
+        a = p.contents
+        guid = _dec(a.AdapterName)
+        desc = _dec(a.Description).strip()
+        mac = ":".join("%02x" % b for b in a.Address[:a.AddressLength]) if a.AddressLength == 6 else ""
+        friendly = ""
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}\%s\Connection" % guid)
+            friendly = winreg.QueryValueEx(k, "Name")[0]
+        except Exception:  # noqa
+            pass
+        kind = {6: "ethernet", 71: "wifi", 24: "loopback"}.get(a.Type, "other")
+        virtual = any(h in desc.lower() for h in _VIRTUAL_HINTS) or kind == "loopback"
+        gw = _dec(a.GatewayList.IpAddress)
+        n = a.IpAddressList
+        while True:
+            ip, mask = _dec(n.IpAddress), _dec(n.IpMask)
+            if ip and ip != "0.0.0.0" and not ip.startswith("127."):
+                out.append({"name": friendly or desc, "desc": desc, "ip": ip, "prefix": _prefix_of(mask), "mac": mac, "kind": kind,
+                            "guid": guid, "gateway": gw if gw != "0.0.0.0" else "", "virtual": virtual})
+            if not n.Next:
+                break
+            n = n.Next.contents
+        p = a.Next
+    return out
+
+
+def list_adapters():
+    """Network adapters that have an IPv4 address, the ones a person would pick from:
+    [{name, desc, ip, prefix, mac, kind: wifi|ethernet|other, guid, gateway, virtual, default}]"""
+    out = []
+    try:
+        if os.name == "nt":
+            out = _win_adapters()
+        elif sys.platform.startswith("linux"):
+            for n in nic_info():
+                if n["name"] == "lo":
+                    continue
+                for cidr in n.get("ip_cidr") or []:
+                    ip, _, pre = cidr.partition("/")
+                    out.append({"name": n["name"], "desc": n.get("driver") or "", "ip": ip, "prefix": int(pre or 24), "mac": n.get("mac") or "",
+                                "kind": "wifi" if n.get("wireless") else "ethernet" if n.get("ether") else "other", "guid": "", "gateway": "",
+                                "virtual": bool(n.get("virtual"))})
+        else:
+            for i in list_ifaces():
+                if i.get("ip") and not i["ip"].startswith("127."):
+                    out.append({"name": i["name"], "desc": i.get("state") or "", "ip": i["ip"], "prefix": 24, "mac": "", "kind": "other",
+                                "guid": "", "gateway": "", "virtual": False})
+    except Exception:  # noqa
+        pass
+    try:
+        dflt = mgmt_ip()
+    except Exception:  # noqa
+        dflt = ""
+    for a in out:
+        a["default"] = bool(dflt) and a["ip"] == dflt
+    out.sort(key=lambda a: (not a["default"], a["virtual"], a["kind"] != "wifi" and a["kind"] != "ethernet", a["name"].lower()))
+    return out
+
+
+def adapter_label(a):
+    kind = {"wifi": "Wi-Fi", "ethernet": "Ethernet"}.get(a["kind"], "")
+    bits = [a["name"]]
+    if a["desc"] and a["desc"] != a["name"]:
+        bits.append("(%s)" % a["desc"][:40])
+    bits.append("- %s/%d" % (a["ip"], a["prefix"]))
+    tag = ", ".join(x for x in (kind, "virtual" if a["virtual"] else "", "default route" if a.get("default") else "") if x)
+    return " ".join(bits) + ("   [%s]" % tag if tag else "")
+
+
+def capture_iface_for(ad):
+    """What run_capture() needs to listen on the chosen adapter."""
+    if not ad:
+        return ""
+    if sys.platform.startswith("linux"):
+        return ad["name"]
+    if os.name == "nt" and not npcap_present():
+        return ad["ip"]            # built-in listener binds to the adapter's address
+    try:
+        from scapy.all import conf
+        for i in conf.ifaces.values():
+            if getattr(i, "ip", "") == ad["ip"]:
+                return getattr(i, "network_name", None) or i.name
+    except Exception:  # noqa
+        pass
+    return (r"\Device\NPF_" + ad["guid"]) if ad.get("guid") else ad["name"]
+
+
+def _central_ctx(url, cafile=None, insecure=False):
+    if not url.lower().startswith("https"):
+        return None
+    if insecure:
+        return ssl._create_unverified_context()
+    return ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+
+
+def test_central(url, token, cafile=None, insecure=False, site="", timeout=8):
+    """Step-by-step check of the link to the server. -> (steps, scan_mode). steps = [(label, ok, detail)], ok True / False / None (note)."""
+    from urllib.parse import urlparse
+    steps, mode = [], ""
+
+    def add(label, ok, detail=""):
+        steps.append((label, ok, detail))
+        return ok
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        add("Server address", False, "type the address of the central server first, for example https://central.example.com")
+        return steps, mode
+    pu = urlparse(url if "://" in url else "https://" + url)
+    if "://" not in url:
+        url = "https://" + url
+    if pu.scheme not in ("http", "https") or not pu.hostname:
+        add("Server address", False, "%r is not a web address (use http://host:port or https://host)" % url)
+        return steps, mode
+    port = pu.port or (443 if pu.scheme == "https" else 80)
+    add("Server address", True, "%s  (host %s, port %d)" % (url, pu.hostname, port))
+    try:
+        ips = sorted({x[4][0] for x in socket.getaddrinfo(pu.hostname, port, type=socket.SOCK_STREAM)})
+        add("Name lookup (DNS)", True, ", ".join(ips[:4]))
+    except OSError as e:
+        add("Name lookup (DNS)", False, "this PC cannot find %s: %s" % (pu.hostname, e))
+        return steps, mode
+    t0 = time.time()
+    try:
+        sk = socket.create_connection((pu.hostname, port), timeout=timeout)
+        add("Network connection (TCP)", True, "connected in %d ms" % int((time.time() - t0) * 1000))
+    except OSError as e:
+        add("Network connection (TCP)", False, "cannot connect to %s:%d - %s. Check internet / VPN / firewall." % (pu.hostname, port, e))
+        return steps, mode
+    ctx = None
+    try:
+        ctx = _central_ctx(url, cafile, insecure)
+        if pu.scheme == "https":
+            try:
+                ss = ctx.wrap_socket(sk, server_hostname=pu.hostname)
+                add("Secure connection (TLS)", True, "%s%s" % (ss.version() or "TLS", "  (certificate NOT checked)" if insecure else "  certificate trusted"))
+                ss.close()
+            except ssl.SSLCertVerificationError as e:
+                add("Secure connection (TLS)", False, "certificate not trusted: %s. Put the server's certificate in 'Certificate file' or tick 'Do not verify' (lab only)." % (e.verify_message or e))
+                return steps, mode
+            except (ssl.SSLError, OSError) as e:
+                add("Secure connection (TLS)", False, str(e))
+                return steps, mode
+        else:
+            sk.close()
+            add("Secure connection (TLS)", None, "plain http: the site token and the data cross the network unencrypted")
+    finally:
+        try:
+            sk.close()
+        except OSError:
+            pass
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url + "/health", headers={"User-Agent": "otsense-sensor/" + VERSION}), timeout=timeout, context=ctx) as r:
+            add("Server answers", True, "HTTP %d" % r.status)
+    except urllib.error.HTTPError as e:
+        add("Server answers", None, "HTTP %d on /health (older server?) - continuing" % e.code)
+    except Exception as e:  # noqa
+        add("Server answers", False, str(e))
+        return steps, mode
+    if not (token or "").strip():
+        add("Site token", False, "no token entered (copy it from central: Sites > Build a sensor)")
+        return steps, mode
+    body = gzip.compress(json.dumps({"v": 2, "site": site, "assets": [], "flows": [], "alerts": [], "activities": []}).encode())
+    req = urllib.request.Request(url + "/api/ingest", data=body, method="POST", headers={
+        "Content-Type": "application/json", "Content-Encoding": "gzip", "Authorization": "Bearer " + token.strip(),
+        "User-Agent": "otsense-sensor/" + VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            resp = json.loads(r.read() or b"{}")
+        mode = str(resp.get("scan_mode") or "").lower()
+        add("Site token accepted", True, "site '%s'%s" % (resp.get("site", "?"), ("; central sets scanning to " + mode) if mode in ("active", "passive") else ""))
+    except urllib.error.HTTPError as e:
+        add("Site token accepted", False, "central says HTTP %d%s" % (e.code, " - the token is wrong or was renewed; download the sensor again or paste the new token" if e.code == 401 else ""))
+    except Exception as e:  # noqa
+        add("Site token accepted", False, str(e))
+    return steps, mode
+
+
+_PKT_FLAGS = ((2, "SYN"), (16, "ACK"), (1, "FIN"), (4, "RST"), (8, "PSH"))
+_ICMP = {0: "echo reply", 3: "unreachable", 8: "echo request", 11: "time exceeded"}
+_ICMP6 = {128: "echo request", 129: "echo reply", 133: "router solicit", 134: "router advert", 135: "neighbour solicit", 136: "neighbour advert"}
+
+
+def packet_row(ts, d, link):
+    """One line for the packet list: (time, source, destination, protocol, length, info, is_ot)."""
+    n = len(d)
+    t = time.strftime("%H:%M:%S", time.localtime(ts)) + ".%03d" % int((ts % 1) * 1000)
+    r = parse_l2(link, d)
+    if not r:
+        return (t, "", "", "?", n, "frame not understood", False)
+    smac, dmac, vlan, et, pay = r
+    if et == 0x0806 and len(pay) >= 28:
+        op, sip, tip, sm = u16(pay, 6), socket.inet_ntoa(pay[14:18]), socket.inet_ntoa(pay[24:28]), mac_str(pay[8:14])
+        info = ("Who has %s? Tell %s" % (tip, sip)) if op == 1 else ("%s is at %s" % (sip, sm)) if op == 2 else "ARP op %d" % op
+        return (t, sip, tip, "ARP", n, info, False)
+    if et in (0x0800, 0x86DD):
+        p = parse_ip(et, pay)
+        if not p:
+            return (t, smac or "", dmac or "", "IP", n, "damaged IP packet", False)
+        src, dst, proto, ttl, l4, frag = p
+        if proto in (6, 17) and len(l4) >= 8 and not frag:
+            sp, dp = u16(l4, 0), u16(l4, 2)
+            name = "tcp" if proto == 6 else "udp"
+            lab, ot = port_label(name, dp)
+            if not lab:
+                lab, ot = port_label(name, sp)
+            fl = ""
+            if proto == 6 and len(l4) >= 14:
+                fl = " [%s]" % ",".join(nm for bit, nm in _PKT_FLAGS if l4[13] & bit)
+            return (t, src, dst, lab or name.upper(), n, "%d \u2192 %d%s" % (sp, dp, fl), bool(ot))
+        if proto == 1 and len(l4) >= 2:
+            return (t, src, dst, "ICMP", n, _ICMP.get(l4[0], "type %d" % l4[0]), False)
+        if proto == 58 and len(l4) >= 1:
+            return (t, src, dst, "ICMPv6", n, _ICMP6.get(l4[0], "type %d" % l4[0]), False)
+        return (t, src, dst, {2: "IGMP", 6: "TCP", 17: "UDP", 47: "GRE", 50: "ESP"}.get(proto, "IP proto %d" % proto), n, "", False)
+    nm = L2_NAMES.get(et)
+    return (t, smac or "", dmac or "", nm or "0x%04X" % et, n, "layer-2 frame", bool(nm and et != 0x88F7 and et != 0x88CC))
+
+
+GUI_CONF_KEYS = ("SITE", "CENTRAL", "TOKEN", "SCAN", "INTERVAL", "ADAPTER", "MINUTES", "INSECURE", "CAFILE")
+
+
+def _gui_conf_paths():
+    ap = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return [os.path.join(_app_dir(), "sensor.conf"), os.path.join(ap, "OTSense", "sensor.conf")]
+
+
+def write_conf(path, updates):
+    """Change/add KEY=value lines in sensor.conf, keep everything else (comments, other keys) as it was."""
+    lines = []
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        pass
+    left = {k: str(v).replace("\r", " ").replace("\n", " ").strip() for k, v in updates.items()}
+    out = []
+    for ln in lines:
+        k = ln.split("=", 1)[0].strip().upper() if "=" in ln and not ln.strip().startswith("#") else None
+        if k in left:
+            out.append("%s=%s" % (k, left.pop(k)))
+        else:
+            out.append(ln)
+    for k, v in left.items():
+        out.append("%s=%s" % (k, v))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(out) + "\n")
+
+
+class GuiSensor(Sensor):
+    """The Sensor push logic, but quiet (log goes to the window) and WITHOUT its own scan loop: the window decides when to scan."""
+    sink = None
+
+    def log(self, msg):
+        if self.sink:
+            self.sink(msg)
+
+    def _apply_scan(self):
+        pass
+
+    def _orders(self, resp):
+        m = str((resp or {}).get("scan_mode") or "").lower()
+        new = m if m in ("passive", "active") else ""
+        if new != self.scan_central:
+            self.scan_central = new
+            self.log("central set scanning to %s" % (new or "the sensor's own choice"))
+
+
+class GuiController:
+    """Everything the window does, without any tkinter in it (so it can be tested on its own)."""
+    PKT_RATE = 300            # packets per second put in the list (counting and the inventory still see every packet)
+
+    def __init__(self, conf_path, conf):
+        self.conf_path = conf_path
+        c = conf or {}
+        survey = int(c.get("SURVEY_MIN") or 0) if str(c.get("SURVEY_MIN") or "").isdigit() else 0
+        self.cfg = {"site": c.get("SITE") or socket.gethostname(), "central": c.get("CENTRAL") or "", "token": c.get("TOKEN") or "",
+                    "scan": "active" if (c.get("SCAN") == "active" or survey) else "passive",
+                    "interval": int(c.get("INTERVAL") or 30) if str(c.get("INTERVAL") or "30").isdigit() else 30,
+                    "adapter": c.get("ADAPTER") or "", "minutes": survey or (int(c["MINUTES"]) if str(c.get("MINUTES") or "").isdigit() else 0),
+                    "insecure": str(c.get("INSECURE") or "") in ("1", "true", "yes"), "cafile": c.get("CAFILE") or "",
+                    "send": True}
+        ca = os.path.join(os.path.dirname(conf_path) if conf_path else _app_dir(), "ca.crt")
+        if not self.cfg["cafile"] and os.path.exists(ca):
+            self.cfg["cafile"] = ca
+        self.lock = threading.RLock()
+        self.logs = collections.deque(maxlen=2000)
+        self.notices = collections.deque()
+        self.pkts, self.pkt_lock = collections.deque(maxlen=20000), threading.Lock()
+        self.pkt_seq = self.pkt_total = self.pkt_skipped = 0
+        self._rate_sec = self._rate_n = 0
+        self.state = "idle"               # idle | running | stopping
+        self.an = Analyzer(None, False)
+        self.sn = None
+        self.scanner = ActiveScanner(self.an)
+        self.stop_ev = threading.Event()
+        self.errs, self.cap_thread = [], None
+        self.t_start = self.t_end = 0
+        self.scan = self._scan_blank()
+        self.central_scan = ""
+        self.devices, self.devices_ver = [], 0
+        self.last_push = {"at": 0, "ok": None, "error": "", "n": 0}
+        self.exported = True
+        self.adapters = []
+        self.refresh_adapters()
+        self._sn_key = None
+
+    # ------------------------------------------------------------ small helpers
+    def log(self, msg):
+        self.logs.append((time.time(), msg))
+
+    @staticmethod
+    def _scan_blank():
+        return {"state": "not run", "done": 0, "total": 0, "found": 0, "list": [], "subnet": "", "method": "", "error": "", "adapter": "", "t0": 0, "t1": 0}
+
+    def refresh_adapters(self):
+        self.adapters = list_adapters()
+        return self.adapters
+
+    def adapter(self):
+        want = self.cfg.get("adapter") or ""
+        for a in self.adapters:
+            if want and want in (a["ip"], a["guid"], a["name"]):
+                return a
+        for a in self.adapters:
+            if a.get("default"):
+                return a
+        return self.adapters[0] if self.adapters else None
+
+    def effective_mode(self):
+        return self.central_scan or self.cfg["scan"]
+
+    def save_settings(self):
+        c = self.cfg
+        upd = {"SITE": c["site"], "CENTRAL": c["central"], "TOKEN": c["token"], "SCAN": c["scan"], "INTERVAL": c["interval"],
+               "ADAPTER": (self.adapter() or {}).get("ip", "") or c.get("adapter", ""), "MINUTES": c["minutes"], "INSECURE": "1" if c["insecure"] else "0",
+               "CAFILE": c["cafile"] if c["cafile"] and os.path.basename(c["cafile"]) != "ca.crt" else ""}
+        tried = []
+        for p in ([self.conf_path] if self.conf_path else []) + _gui_conf_paths():
+            if p in tried:
+                continue
+            tried.append(p)
+            try:
+                write_conf(p, upd)
+                self.conf_path = p
+                self.log("settings saved to %s" % p)
+                return True, p
+            except OSError:
+                continue
+        return False, "cannot write sensor.conf (tried: %s)" % "; ".join(tried)
+
+    def _sensor(self, new=False):
+        c = self.cfg
+        key = (c["site"], c["central"].strip(), c["token"].strip(), c["interval"], c["cafile"], c["insecure"])
+        if self.sn is None or new or key != self._sn_key:
+            if not c["central"].strip() or not c["token"].strip():
+                self.sn = None
+                return None
+            ad = self.adapter()
+            old = self.sn
+            self.sn = GuiSensor(self.an, c["site"], c["central"].strip(), c["token"].strip(), c["interval"], c["cafile"] or None,
+                                c["insecure"], (ad or {}).get("name", "") or "any", "live")
+            self.sn.sink = self.log
+            self.sn.active = self.scanner
+            self.sn.scan_local = c["scan"]
+            if old is not None and not new:
+                self.sn.scan_central = old.scan_central
+            self._sn_key = key
+            try:
+                from urllib.parse import urlparse
+                cu = urlparse(self.sn.url)
+                self.an.exclude = (socket.gethostbyname(cu.hostname), cu.port or (443 if cu.scheme == "https" else 80))
+            except Exception:  # noqa
+                pass
+        return self.sn
+
+    # ------------------------------------------------------------ packets
+    def _on_packet(self, ts, d, link):
+        self.pkt_total += 1
+        sec = int(time.time())
+        if sec != self._rate_sec:
+            self._rate_sec, self._rate_n = sec, 0
+        self._rate_n += 1
+        if self._rate_n > self.PKT_RATE:
+            self.pkt_skipped += 1
+            return
+        try:
+            row = packet_row(ts, d, link)
+        except Exception:  # noqa
+            return
+        ex = self.an.exclude
+        if ex and ex[0] in (row[1], row[2]) and ("%d" % ex[1]) in row[5]:
+            return                                  # the sensor's own traffic to the server
+        with self.pkt_lock:
+            self.pkt_seq += 1
+            self.pkts.append((self.pkt_seq, row))
+
+    def packets_since(self, last, limit=400):
+        with self.pkt_lock:
+            if not self.pkts:
+                return [], last
+            first = self.pkts[0][0]
+            start = max(0, last + 1 - first)
+            rows = list(__import__("itertools").islice(self.pkts, start, start + limit))
+        if not rows:
+            return [], last
+        return [r for _s, r in rows], rows[-1][0]
+
+    def clear_packets(self):
+        with self.pkt_lock:
+            self.pkts.clear()
+
+    # ------------------------------------------------------------ run control
+    def start(self):
+        with self.lock:
+            if self.state != "idle":
+                return False, "already running"
+            self.refresh_adapters() if not self.adapters else None
+            ad = self.adapter()
+            if not ad:
+                return False, "no network adapter with an IPv4 address was found. Connect to a network and press Refresh."
+            self.an = Analyzer(None, False)
+            self.scanner = ActiveScanner(self.an)
+            self.sn = None
+            self._sensor(new=True)
+            self.errs, self.stop_ev = [], threading.Event()
+            self.pkts.clear()
+            self.pkt_seq = self.pkt_total = self.pkt_skipped = 0
+            self.scan = self._scan_blank()
+            self.last_push = {"at": 0, "ok": None, "error": "", "n": 0}
+            self.devices, self.devices_ver = [], self.devices_ver + 1
+            self.exported = False
+            self.t_start, self.t_end, self.state = time.time(), 0, "running"
+            self.an.source = "live: %s (%s)" % (ad["name"], ad["ip"])
+            self._next_push = time.time() + 5
+            self._push_fail = 0
+            iface = capture_iface_for(ad)
+        self.log("started on %s %s, scanning: %s%s" % (ad["name"], ad["ip"], self.effective_mode(),
+                                                      (", stops after %d min" % self.cfg["minutes"]) if self.cfg["minutes"] else ""))
+        if os.name == "nt" and not npcap_present():
+            self.log("Npcap not installed: built-in listening (IP traffic only, no MAC/ARP). Run as Administrator.")
+        self.cap_thread = threading.Thread(target=run_capture, args=(self.an, iface, self.stop_ev, None, None, self.errs, None, self._on_packet), daemon=True)
+        self.cap_thread.start()
+        threading.Thread(target=self._supervise, daemon=True).start()
+        if self.effective_mode() == "active":
+            self.scan_now()
+        return True, ""
+
+    def scan_now(self):
+        with self.lock:
+            if self.state != "running":
+                return False, "press Start first"
+            if self.scan["state"] == "running":
+                return False, "a scan is already running"
+            ad = self.adapter()
+            if not ad:
+                return False, "no adapter"
+            self.scan = self._scan_blank()
+            self.scan.update(state="running", adapter=ad["name"], subnet="%s/%d" % (ad["ip"], ad["prefix"]), t0=time.time())
+        threading.Thread(target=self._scan_worker, args=(ad,), daemon=True).start()
+        return True, ""
+
+    def _scan_worker(self, ad):
+        self.log("device scan started on %s (%s/%d)" % (ad["name"], ad["ip"], ad["prefix"]))
+        try:
+            lst = self.scanner.run_once({"ip": ad["ip"], "prefix": ad["prefix"], "name": ad["name"], "mac": ad.get("mac", "")}, self.stop_ev)
+            with self.lock:
+                self.scan.update(state="done", found=len(lst), list=lst, subnet=self.scanner.result.get("subnet", ""),
+                                 method=self.scanner.result.get("method", ""), t1=time.time())
+            self.log("device scan finished: %d devices found" % len(lst))
+        except Exception as e:  # noqa
+            with self.lock:
+                self.scan.update(state="cancelled" if self.stop_ev.is_set() else "error", error=str(e)[:300], t1=time.time())
+            self.log("device scan %s: %s" % ("cancelled" if self.stop_ev.is_set() else "failed", e))
+
+    def stop(self, reason="stopped"):
+        with self.lock:
+            if self.state != "running":
+                return False
+            self.state = "stopping"
+        self.stop_ev.set()
+        self.log(reason)
+        threading.Thread(target=self._finish_run, daemon=True).start()
+        return True
+
+    def _finish_run(self):
+        if self.cap_thread:
+            self.cap_thread.join(4)
+        self.t_end = time.time()
+        sn, failed, err = self.sn, False, ""
+        if sn is not None and self.cfg["send"] and (self.an.pkts or self.an.assets):
+            self.log("sending the final results to the server...")
+            ok = self._push()
+            failed, err = (not ok), sn._last_err or ""
+        elif self.an.pkts or self.an.assets:
+            failed, err = True, "sending to the server is switched off or not set up"
+        with self.lock:
+            self.state = "idle"
+            self.devices_ver += 1
+        if failed and (self.an.pkts or self.an.assets):
+            self.notices.append({"kind": "export", "text": "The results could not be sent to the server:\n%s\n\nSave the inventory to files on this PC now?" % err})
+
+    def _push(self):
+        sn = self.sn
+        if sn is None:
+            return False
+        try:
+            ok = sn.push()
+        except Exception as e:  # noqa
+            sn._last_err = "send failed: %s" % e
+            ok = False
+        self.central_scan = sn.scan_central
+        self.last_push = {"at": time.time(), "ok": ok, "error": "" if ok else (sn._last_err or "failed"), "n": sn.pushes}
+        return ok
+
+    def send_now(self):
+        """Push what is in the inventory to the server right now (works while running or after Stop)."""
+        sn = self._sensor()
+        if sn is None:
+            return False, "server address or token missing (Server tab)"
+        ok = self._push()
+        return ok, "" if ok else (sn._last_err or "failed")
+
+    def _supervise(self):
+        last_dev = 0
+        while self.state == "running":
+            time.sleep(0.5)
+            now = time.time()
+            if self.cfg["minutes"] and now - self.t_start >= self.cfg["minutes"] * 60:
+                self.stop("time is up (%d min) - stopping" % self.cfg["minutes"])
+                return
+            if self.cap_thread and not self.cap_thread.is_alive() and not self.stop_ev.is_set() and self.scan["state"] != "running":
+                msg = "; ".join(self.errs) or "listening stopped"
+                if self.an.pkts or self.scan["state"] == "done":
+                    self.stop("listening stopped: " + msg)
+                else:
+                    self.stop("listening failed: " + msg)
+                    self.notices.append({"kind": "error", "text": msg})
+                return
+            if self.sn is not None and self.cfg["send"] and now >= self._next_push:
+                ok = self._push()
+                self._push_fail = 0 if ok else self._push_fail + 1
+                self._next_push = time.time() + (self.sn.interval if ok else min(300, self.sn.interval * (2 ** min(self._push_fail, 4))))
+                if ok and self.central_scan == "active" and self.scan["state"] == "not run":
+                    self.scan_now()
+            if now - last_dev >= 3:
+                last_dev = now
+                self._refresh_devices()
+
+    def _refresh_devices(self):
+        try:
+            snap = self.an.snapshot()
+        except Exception:  # noqa
+            return
+        rows = []
+        for a in snap["assets"]:
+            fl = a.get("flags") or []
+            src = ("scan+traffic" if a["tx_packets"] else "scan") if "active-scan" in fl else "listening"
+            rows.append((a["ip"] or "-", a["mac"] or "-", a["vendor"] or "-", a["device_type"] or "-", ", ".join(a["hostnames"]) or "-", src,
+                         (a["last_seen"] or "")[11:19], a["tx_packets"] + a["rx_packets"]))
+        self.devices, self.devices_ver = rows, self.devices_ver + 1
+
+    # ------------------------------------------------------------ status for the window
+    def status(self):
+        now = time.time()
+        with self.lock:
+            sc = dict(self.scan)
+            sc.pop("list", None)
+            sc["done"], sc["total"] = self.scanner.progress if sc["state"] == "running" else (sc["done"], sc["total"])
+        sn = self.sn
+        with self.an.lock:
+            devs = sum(1 for a in self.an.assets.values() if a.alive)
+            nalerts = len(self.an.alerts)
+        up = ((self.t_end or now) - self.t_start) if self.t_start else 0
+        lp = self.last_push
+        return {"state": self.state, "packets": self.an.pkts, "bytes": self.an.bytes, "devices": devs, "alerts": nalerts, "elapsed": up,
+                "minutes": self.cfg["minutes"], "scan": sc, "mode": self.effective_mode(), "central_scan": self.central_scan,
+                "errors": list(self.errs), "listed": self.pkt_seq, "skipped": self.pkt_skipped, "server": bool(sn),
+                "send": self.cfg["send"], "push_ok": lp["ok"], "push_ago": int(now - lp["at"]) if lp["at"] else None,
+                "push_error": lp["error"], "pending": getattr(sn, "pending", 0) if sn else 0, "exported": self.exported}
+
+    def scan_list(self):
+        with self.lock:
+            return list(self.scan.get("list") or [])
+
+    # ------------------------------------------------------------ export
+    def export(self, outdir):
+        """Write the inventory (and the device-scan list) as files - the way out when the server cannot be reached."""
+        snap = self.an.snapshot()
+        paths = write_reports(snap, outdir)
+        lst = self.scan_list()
+        if lst:
+            p = os.path.join(outdir, "device-scan.csv")
+            with open(p, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["ip", "mac", "vendor", "name"])
+                for x in lst:
+                    w.writerow([x["ip"], x["mac"], x["vendor"], x.get("name", "")])
+            paths["device_scan"] = p
+        self.exported = True
+        self.log("inventory exported to %s" % outdir)
+        return paths
+
+    def has_data(self):
+        return bool(self.an.pkts or self.an.assets)
+
+
+tk = ttk = filedialog = messagebox = None
+
+C_BG, C_PANEL, C_FG, C_MUTED, C_ACC, C_OK, C_WARN, C_BAD = "#0f1722", "#18222f", "#e8eef7", "#9fb0c6", "#17636a", "#2ecc71", "#f5a623", "#e5534b"
+
+
+def _load_tk():
+    global tk, ttk, filedialog, messagebox
+    import tkinter as _tk
+    from tkinter import ttk as _ttk, filedialog as _fd, messagebox as _mb
+    tk, ttk, filedialog, messagebox = _tk, _ttk, _fd, _mb
+
+
+def _fmt_dur(s):
+    s = int(max(0, s))
+    return "%d:%02d:%02d" % (s // 3600, (s // 60) % 60, s % 60)
+
+
+class GuiApp:
+    def __init__(self, ctl):
+        self.ctl = ctl
+        self.root = root = tk.Tk()
+        root.title("OT Sense Sensor %s" % VERSION)
+        root.geometry("1120x760")
+        root.minsize(940, 620)
+        root.configure(bg=C_BG)
+        self.ui_q = collections.deque()
+        self.closing = False
+        self.warned_active = False
+        self.pkt_last = 0
+        self.dev_ver = -1
+        self.log_n = 0
+        self._style()
+        self.v = {k: tk.StringVar() for k in ("site", "central", "token", "interval", "cafile", "minutes", "filter", "adapter")}
+        self.b = {k: tk.BooleanVar() for k in ("insecure", "send", "pause", "autoscroll", "showtok")}
+        self.mode = tk.StringVar(value=ctl.cfg["scan"])
+        self._load_vars()
+        self._header()
+        self._controls()
+        self._progress()
+        self._tabs()
+        self.status_line = tk.StringVar(value="Ready. Choose a network adapter and press Start.")
+        tk.Label(root, textvariable=self.status_line, anchor="w", bg=C_PANEL, fg=C_MUTED, padx=10, pady=4).pack(fill="x", side="bottom")
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._fill_adapters()
+        self._tick()
+
+    # ------------------------------------------------------------ look
+    def _style(self):
+        st = ttk.Style(self.root)
+        try:
+            st.theme_use("clam")
+        except Exception:  # noqa
+            pass
+        st.configure(".", background=C_BG, foreground=C_FG, fieldbackground=C_PANEL, font=("Segoe UI", 10))
+        st.configure("TLabel", background=C_BG, foreground=C_FG)
+        st.configure("TFrame", background=C_BG)
+        st.configure("TLabelframe", background=C_BG, foreground=C_MUTED, bordercolor="#27364f")
+        st.configure("TLabelframe.Label", background=C_BG, foreground=C_MUTED)
+        st.configure("TCheckbutton", background=C_BG, foreground=C_FG)
+        st.configure("TRadiobutton", background=C_BG, foreground=C_FG)
+        st.configure("TButton", background="#223044", foreground=C_FG, padding=(12, 6), bordercolor="#27364f")
+        st.map("TButton", background=[("active", "#2d3f58"), ("disabled", "#141c27")], foreground=[("disabled", "#5d6b7e")])
+        st.configure("Go.TButton", background=C_ACC, foreground="#ffffff", font=("Segoe UI", 11, "bold"), padding=(18, 8))
+        st.map("Go.TButton", background=[("active", "#1f7f88"), ("disabled", "#141c27")])
+        st.configure("Stop.TButton", background="#8a2b2b", foreground="#ffffff", font=("Segoe UI", 11, "bold"), padding=(18, 8))
+        st.map("Stop.TButton", background=[("active", "#a83a3a"), ("disabled", "#141c27")])
+        st.configure("TNotebook", background=C_BG, bordercolor="#27364f")
+        st.configure("TNotebook.Tab", background=C_PANEL, foreground=C_MUTED, padding=(14, 6))
+        st.map("TNotebook.Tab", background=[("selected", "#223044")], foreground=[("selected", C_FG)])
+        st.configure("Treeview", background=C_PANEL, fieldbackground=C_PANEL, foreground=C_FG, rowheight=22, bordercolor="#27364f")
+        st.configure("Treeview.Heading", background="#223044", foreground=C_FG, relief="flat")
+        st.map("Treeview", background=[("selected", C_ACC)])
+        st.configure("Horizontal.TProgressbar", troughcolor=C_PANEL, background="#4aa3ff", bordercolor=C_PANEL, thickness=16)
+        st.configure("TEntry", fieldbackground=C_PANEL, foreground=C_FG, insertcolor=C_FG)
+        st.configure("TCombobox", fieldbackground=C_PANEL, foreground=C_FG, background=C_PANEL, arrowcolor=C_FG)
+        st.configure("TSpinbox", fieldbackground=C_PANEL, foreground=C_FG, arrowcolor=C_FG)
+        try:   # Tk 8.6.9 ignores row colours (the orange OT rows) unless this well-known workaround is applied
+            for opt in ("foreground", "background"):
+                st.map("Treeview", **{opt: [e for e in st.map("Treeview", query_opt=opt) if e[:2] != ("!disabled", "!selected")]})
+        except Exception:  # noqa
+            pass
+
+    def _load_vars(self):
+        c = self.ctl.cfg
+        for k in ("site", "central", "token", "cafile"):
+            self.v[k].set(c[k])
+        self.v["interval"].set(str(c["interval"]))
+        self.v["minutes"].set(str(c["minutes"]))
+        self.b["insecure"].set(c["insecure"])
+        self.b["send"].set(c["send"])
+        self.b["autoscroll"].set(True)
+        self.mode.set(c["scan"])
+
+    def _read_vars(self):
+        """Copy what is typed in the window into the controller. -> error text or ''."""
+        c = self.ctl.cfg
+        c["site"] = self.v["site"].get().strip() or socket.gethostname()
+        c["central"] = self.v["central"].get().strip()
+        c["token"] = self.v["token"].get().strip()
+        c["cafile"] = self.v["cafile"].get().strip()
+        c["insecure"] = bool(self.b["insecure"].get())
+        c["send"] = bool(self.b["send"].get())
+        c["scan"] = "active" if self.mode.get() == "active" else "passive"
+        try:
+            c["interval"] = max(5, int(self.v["interval"].get()))
+            c["minutes"] = max(0, min(1440, int(self.v["minutes"].get() or 0)))
+        except ValueError:
+            return "Interval and minutes must be whole numbers."
+        ad = self._chosen_adapter()
+        if ad:
+            c["adapter"] = ad["ip"]
+        return ""
+
+    def _chosen_adapter(self):
+        i = self.cb_adapter.current()
+        return self.ctl.adapters[i] if 0 <= i < len(self.ctl.adapters) else self.ctl.adapter()
+
+    # ------------------------------------------------------------ layout
+    def _header(self):
+        f = tk.Frame(self.root, bg=C_PANEL)
+        f.pack(fill="x")
+        tk.Label(f, text="OT Sense Sensor", bg=C_PANEL, fg=C_FG, font=("Segoe UI", 16, "bold"), padx=14, pady=10).pack(side="left")
+        self.pill = tk.Label(f, text=" STOPPED ", bg="#33445a", fg="#ffffff", font=("Segoe UI", 10, "bold"), padx=8, pady=2)
+        self.pill.pack(side="left", padx=6)
+        self.lbl_site = tk.Label(f, text="", bg=C_PANEL, fg=C_MUTED, padx=10)
+        self.lbl_site.pack(side="right")
+        self.admin_bar = tk.Frame(self.root, bg="#4a3a10")
+        self.admin_lbl = tk.Label(self.admin_bar, text="This program is not running as Administrator and Npcap is not installed: listening will not work. "
+                                  "Active scanning still works.", bg="#4a3a10", fg="#ffd98a", padx=10, pady=5, anchor="w")
+        self.admin_lbl.pack(side="left", fill="x", expand=True)
+        ttk.Button(self.admin_bar, text="Restart as administrator", command=self.on_elevate).pack(side="right", padx=8, pady=3)
+        if os.name == "nt" and not _is_admin() and not npcap_present():
+            self.admin_bar.pack(fill="x")
+        self.err_bar = tk.Label(self.root, text="", bg="#4a2020", fg="#ffb4ae", anchor="w", padx=10, pady=5, justify="left", wraplength=1050)
+
+    def _controls(self):
+        f = ttk.LabelFrame(self.root, text=" Run ")
+        f.pack(fill="x", padx=12, pady=(10, 4))
+        r0 = ttk.Frame(f)
+        r0.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(r0, text="Network adapter").pack(side="left")
+        self.cb_adapter = ttk.Combobox(r0, textvariable=self.v["adapter"], state="readonly", width=84)
+        self.cb_adapter.pack(side="left", padx=8, fill="x", expand=True)
+        self.cb_adapter.bind("<<ComboboxSelected>>", lambda e: self._adapter_changed())
+        self.btn_refresh = ttk.Button(r0, text="Refresh", command=self.on_refresh)
+        self.btn_refresh.pack(side="left")
+        self.lbl_adapter = ttk.Label(f, text="", foreground=C_MUTED)
+        self.lbl_adapter.pack(fill="x", padx=10)
+        r1 = ttk.Frame(f)
+        r1.pack(fill="x", padx=8, pady=4)
+        ttk.Label(r1, text="Scanning").pack(side="left")
+        self.rb_passive = ttk.Radiobutton(r1, text="Passive - only listen, send nothing", variable=self.mode, value="passive", command=self._mode_changed)
+        self.rb_active = ttk.Radiobutton(r1, text="Active - also ask every device on the adapter's network", variable=self.mode, value="active", command=self._mode_changed)
+        self.rb_passive.pack(side="left", padx=10)
+        self.rb_active.pack(side="left", padx=4)
+        self.lbl_central = ttk.Label(r1, text="", foreground=C_WARN)
+        self.lbl_central.pack(side="left", padx=8)
+        r2 = ttk.Frame(f)
+        r2.pack(fill="x", padx=8, pady=(2, 10))
+        self.btn_start = ttk.Button(r2, text="\u25B6  Start", style="Go.TButton", command=self.on_start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(r2, text="\u25A0  Stop", style="Stop.TButton", command=self.on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=8)
+        self.btn_scan = ttk.Button(r2, text="Scan devices again", command=self.on_scan_again, state="disabled")
+        self.btn_scan.pack(side="left", padx=8)
+        ttk.Button(r2, text="Export inventory...", command=self.on_export).pack(side="left", padx=8)
+        ttk.Label(r2, text="Stop automatically after").pack(side="left", padx=(24, 4))
+        self.sp_min = ttk.Spinbox(r2, from_=0, to=1440, width=5, textvariable=self.v["minutes"])
+        self.sp_min.pack(side="left")
+        ttk.Label(r2, text="min (0 = until I press Stop)").pack(side="left", padx=4)
+
+    def _progress(self):
+        f = ttk.Frame(self.root)
+        f.pack(fill="x", padx=12, pady=4)
+        tiles = ttk.Frame(f)
+        tiles.pack(fill="x")
+        self.t = {}
+        for key, title in (("packets", "Packets seen"), ("devices", "Devices in inventory"), ("scan", "Device scan"), ("server", "Server")):
+            box = tk.Frame(tiles, bg=C_PANEL, padx=12, pady=8)
+            box.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            tk.Label(box, text=title, bg=C_PANEL, fg=C_MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+            var = tk.StringVar(value="-")
+            lab = tk.Label(box, textvariable=var, bg=C_PANEL, fg=C_FG, font=("Segoe UI", 15, "bold"), anchor="w", justify="left")
+            lab.pack(anchor="w", fill="x")
+            sub = tk.StringVar(value="")
+            tk.Label(box, textvariable=sub, bg=C_PANEL, fg=C_MUTED, font=("Segoe UI", 9), anchor="w").pack(anchor="w", fill="x")
+            self.t[key] = (var, sub, lab)
+        self.bar = ttk.Progressbar(f, mode="determinate", maximum=100)
+        self.bar.pack(fill="x", pady=(8, 0))
+        self.bar_text = tk.StringVar(value="Not started.")
+        ttk.Label(f, textvariable=self.bar_text, foreground=C_MUTED).pack(anchor="w")
+        self._bar_busy = False
+
+    def _tree(self, parent, cols, widths, height=14):
+        fr = ttk.Frame(parent)
+        tv = ttk.Treeview(fr, columns=[c[0] for c in cols], show="headings", height=height)
+        for (cid, title), w in zip(cols, widths):
+            tv.heading(cid, text=title)
+            tv.column(cid, width=w, anchor="w", stretch=(cid == cols[-1][0]))
+        ys = ttk.Scrollbar(fr, orient="vertical", command=tv.yview)
+        xs = ttk.Scrollbar(fr, orient="horizontal", command=tv.xview)
+        tv.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        fr.rowconfigure(0, weight=1)
+        fr.columnconfigure(0, weight=1)
+        return fr, tv
+
+    def _tabs(self):
+        nb = self.nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, padx=12, pady=(6, 4))
+        # --- packets
+        p = ttk.Frame(nb)
+        nb.add(p, text="  Live packets  ")
+        bar = ttk.Frame(p)
+        bar.pack(fill="x", pady=6)
+        ttk.Label(bar, text="Filter").pack(side="left")
+        ttk.Entry(bar, textvariable=self.v["filter"], width=28).pack(side="left", padx=6)
+        ttk.Checkbutton(bar, text="Pause list", variable=self.b["pause"]).pack(side="left", padx=8)
+        ttk.Checkbutton(bar, text="Follow newest", variable=self.b["autoscroll"]).pack(side="left", padx=4)
+        ttk.Button(bar, text="Clear list", command=self.on_clear_packets).pack(side="left", padx=8)
+        self.lbl_pk = ttk.Label(bar, text="", foreground=C_MUTED)
+        self.lbl_pk.pack(side="left", padx=8)
+        fr, self.tv_pk = self._tree(p, [("t", "Time"), ("s", "Source"), ("d", "Destination"), ("p", "Protocol"), ("l", "Length"), ("i", "Info")],
+                                    [110, 170, 170, 110, 70, 400])
+        fr.pack(fill="both", expand=True)
+        self.tv_pk.tag_configure("ot", foreground="#ffb347")
+        # --- devices
+        p = ttk.Frame(nb)
+        nb.add(p, text="  Devices found  ")
+        self.lbl_dev = ttk.Label(p, text="", foreground=C_MUTED)
+        self.lbl_dev.pack(anchor="w", pady=6)
+        fr, self.tv_dev = self._tree(p, [("ip", "IP address"), ("mac", "MAC"), ("v", "Vendor"), ("t", "Type"), ("n", "Name"), ("f", "Found by"), ("l", "Last seen"), ("k", "Packets")],
+                                     [120, 140, 160, 150, 180, 100, 80, 70])
+        fr.pack(fill="both", expand=True)
+        # --- device scan
+        p = ttk.Frame(nb)
+        nb.add(p, text="  Device scan  ")
+        self.lbl_scan = ttk.Label(p, text="Device scan: not run.", font=("Segoe UI", 11, "bold"))
+        self.lbl_scan.pack(anchor="w", pady=(8, 0))
+        self.lbl_scan2 = ttk.Label(p, text="Choose Active scanning and press Start to look for the devices on the adapter's network.", foreground=C_MUTED)
+        self.lbl_scan2.pack(anchor="w", pady=(0, 6))
+        fr, self.tv_scan = self._tree(p, [("ip", "IP address"), ("mac", "MAC"), ("v", "Vendor"), ("n", "Name")], [140, 170, 220, 300])
+        fr.pack(fill="both", expand=True)
+        # --- server
+        p = ttk.Frame(nb)
+        nb.add(p, text="  Server  ")
+        g = ttk.Frame(p)
+        g.pack(fill="x", padx=6, pady=10)
+        g.columnconfigure(1, weight=1)
+
+        def row(i, label, widget):
+            ttk.Label(g, text=label).grid(row=i, column=0, sticky="w", pady=4, padx=(0, 10))
+            widget.grid(row=i, column=1, sticky="ew", pady=4)
+        row(0, "Site name", ttk.Entry(g, textvariable=self.v["site"]))
+        row(1, "Server address", ttk.Entry(g, textvariable=self.v["central"]))
+        tf = ttk.Frame(g)
+        self.en_tok = ttk.Entry(tf, textvariable=self.v["token"], show="\u2022")
+        self.en_tok.pack(side="left", fill="x", expand=True)
+        ttk.Checkbutton(tf, text="Show", variable=self.b["showtok"], command=lambda: self.en_tok.configure(show="" if self.b["showtok"].get() else "\u2022")).pack(side="left", padx=6)
+        row(2, "Site token", tf)
+        cf = ttk.Frame(g)
+        ttk.Entry(cf, textvariable=self.v["cafile"]).pack(side="left", fill="x", expand=True)
+        ttk.Button(cf, text="Browse...", command=self.on_browse_ca).pack(side="left", padx=6)
+        row(3, "Certificate file (optional)", cf)
+        row(4, "", ttk.Checkbutton(g, text="Do not check the server's certificate (lab only)", variable=self.b["insecure"]))
+        row(5, "", ttk.Checkbutton(g, text="Send results to the server while running and when I press Stop", variable=self.b["send"]))
+        iv = ttk.Frame(g)
+        ttk.Spinbox(iv, from_=5, to=3600, width=6, textvariable=self.v["interval"]).pack(side="left")
+        ttk.Label(iv, text="seconds between sends").pack(side="left", padx=6)
+        row(6, "Send every", iv)
+        bt = ttk.Frame(p)
+        bt.pack(fill="x", padx=6)
+        self.btn_test = ttk.Button(bt, text="Test connection", command=self.on_test)
+        self.btn_test.pack(side="left")
+        ttk.Button(bt, text="Send inventory now", command=self.on_send_now).pack(side="left", padx=8)
+        ttk.Button(bt, text="Save settings", command=self.on_save).pack(side="left")
+        ttk.Button(bt, text="Export inventory to files...", command=self.on_export).pack(side="left", padx=8)
+        self.txt_test = tk.Text(p, height=11, bg=C_PANEL, fg=C_FG, relief="flat", wrap="word", padx=10, pady=8, state="disabled")
+        self.txt_test.pack(fill="both", expand=True, padx=6, pady=10)
+        for tag, col in (("ok", C_OK), ("bad", C_BAD), ("note", C_WARN), ("dim", C_MUTED)):
+            self.txt_test.tag_configure(tag, foreground=col)
+        # --- log
+        p = ttk.Frame(nb)
+        nb.add(p, text="  Log  ")
+        self.txt_log = tk.Text(p, bg=C_PANEL, fg=C_FG, relief="flat", wrap="word", padx=10, pady=8, state="disabled")
+        sb = ttk.Scrollbar(p, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.txt_log.pack(fill="both", expand=True)
+
+    # ------------------------------------------------------------ adapters
+    def _fill_adapters(self, keep=True):
+        ads = self.ctl.adapters
+        self.cb_adapter["values"] = [adapter_label(a) for a in ads]
+        cur = self.ctl.adapter()
+        idx = ads.index(cur) if cur in ads else (0 if ads else -1)
+        if idx >= 0:
+            self.cb_adapter.current(idx)
+        else:
+            self.v["adapter"].set("(no network adapter with an IPv4 address found)")
+        self._adapter_changed()
+
+    def _adapter_changed(self):
+        a = self._chosen_adapter()
+        if not a:
+            self.lbl_adapter.configure(text="")
+            return
+        net = ipaddress.ip_network("%s/%d" % (a["ip"], a["prefix"]), strict=False)
+        txt = "Address %s   network %s   MAC %s" % (a["ip"], net, a["mac"] or "-")
+        if a["kind"] == "wifi":
+            txt += "\nWi-Fi: passive listening only sees this PC's own traffic and broadcasts. Use Active to find the other devices on this Wi-Fi."
+        elif a["virtual"]:
+            txt += "\nThis looks like a virtual adapter (VM / VPN / Bluetooth). Pick your real Ethernet or Wi-Fi card to see your network."
+        else:
+            txt += "\nOn a normal switch port a PC only sees its own traffic plus broadcasts - use Active, or plug into a mirror (SPAN) port."
+        self.lbl_adapter.configure(text=txt, justify="left")
+
+    def on_refresh(self):
+        self.ctl.refresh_adapters()
+        self._fill_adapters()
+        self.ctl.log("adapters refreshed: %d found" % len(self.ctl.adapters))
+
+    def _mode_changed(self):
+        self.ctl.cfg["scan"] = "active" if self.mode.get() == "active" else "passive"
+
+    # ------------------------------------------------------------ buttons
+    def on_start(self):
+        err = self._read_vars()
+        if err:
+            return messagebox.showerror("OT Sense", err)
+        ctl = self.ctl
+        mode = ctl.effective_mode()
+        if mode == "active" and not self.warned_active:
+            if not messagebox.askokcancel("Active scan", "Active scanning sends short connection attempts and ARP requests to every address of this adapter's network.\n\n"
+                                          "Only do this on a network you own or are allowed to scan (your home network is fine).\n\nContinue?"):
+                return
+            self.warned_active = True
+        if ctl.has_data() and not ctl.exported:
+            a = messagebox.askyesnocancel("Start a new run", "The previous results have not been exported.\n\nExport them now before they are cleared?")
+            if a is None:
+                return
+            if a and not self.on_export():
+                return
+        ok, msg = ctl.start()
+        if not ok:
+            messagebox.showerror("OT Sense", msg)
+        self.nb.select(0)
+        self.on_clear_packets()
+        self.pkt_last = 0
+
+    def on_stop(self):
+        self._read_vars()
+        self.ctl.stop("stopped by the user")
+
+    def on_scan_again(self):
+        ok, msg = self.ctl.scan_now()
+        if not ok:
+            messagebox.showinfo("OT Sense", msg)
+        else:
+            self.nb.select(2)
+
+    def on_clear_packets(self):
+        self.tv_pk.delete(*self.tv_pk.get_children())
+        self.ctl.clear_packets()
+
+    def on_browse_ca(self):
+        p = filedialog.askopenfilename(title="Certificate of the server", filetypes=[("Certificate", "*.crt *.pem *.cer"), ("All files", "*.*")])
+        if p:
+            self.v["cafile"].set(p)
+
+    def on_save(self):
+        err = self._read_vars()
+        if err:
+            return messagebox.showerror("OT Sense", err)
+        ok, p = self.ctl.save_settings()
+        (messagebox.showinfo if ok else messagebox.showerror)("OT Sense", ("Settings saved to\n%s" % p) if ok else p)
+
+    def on_export(self):
+        if not self.ctl.has_data():
+            messagebox.showinfo("OT Sense", "There is nothing to export yet. Press Start first.")
+            return False
+        d = filedialog.askdirectory(title="Choose a folder for the inventory files")
+        if not d:
+            return False
+        out = os.path.join(d, "OTSense-inventory-" + time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            paths = self.ctl.export(out)
+        except OSError as e:
+            messagebox.showerror("OT Sense", "Could not write the files: %s" % e)
+            return False
+        messagebox.showinfo("OT Sense", "Inventory saved in\n%s\n\n%s" % (out, "\n".join(sorted(os.path.basename(x) for x in paths.values()))))
+        try:
+            if os.name == "nt":
+                os.startfile(out)      # noqa
+        except Exception:  # noqa
+            pass
+        return True
+
+    def on_test(self):
+        err = self._read_vars()
+        if err:
+            return messagebox.showerror("OT Sense", err)
+        c = self.ctl.cfg
+        self._show_test([("Testing the connection...", None, "")])
+        self.btn_test.configure(state="disabled")
+
+        def work():
+            try:
+                steps, mode = test_central(c["central"], c["token"], c["cafile"] or None, c["insecure"], c["site"])
+            except Exception as e:  # noqa
+                steps, mode = [("Test", False, str(e))], ""
+            self.ui_q.append(lambda: self._test_done(steps, mode))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _test_done(self, steps, mode):
+        self.btn_test.configure(state="normal")
+        self._show_test(steps)
+        if steps and all(s[1] is not False for s in steps):
+            self.ctl.central_scan = mode if mode in ("active", "passive") else ""
+            self.ctl.log("connection test passed")
+        else:
+            self.ctl.log("connection test FAILED: " + "; ".join("%s: %s" % (s[0], s[2]) for s in steps if s[1] is False))
+
+    def _show_test(self, steps):
+        t = self.txt_test
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        for label, ok, detail in steps:
+            t.insert("end", ("\u2714  " if ok else "\u2718  " if ok is False else "\u2022  "), "ok" if ok else "bad" if ok is False else "note")
+            t.insert("end", label, "ok" if ok else "bad" if ok is False else "note")
+            if detail:
+                t.insert("end", "\n      " + detail, "dim")
+            t.insert("end", "\n")
+        if steps and steps[-1][1] is False:
+            t.insert("end", "\nThe inventory stays on this PC. Use 'Export inventory to files' to save it, and send it later.", "dim")
+        elif steps and all(s[1] is not False for s in steps) and len(steps) > 1:
+            t.insert("end", "\nEverything works. You can press Start.", "ok")
+        t.configure(state="disabled")
+
+    def on_send_now(self):
+        err = self._read_vars()
+        if err:
+            return messagebox.showerror("OT Sense", err)
+
+        def work():
+            ok, msg = self.ctl.send_now()
+            self.ui_q.append(lambda: (messagebox.showinfo("OT Sense", "Sent to the server.") if ok else
+                                      (messagebox.showerror("OT Sense", "Could not send to the server:\n%s\n\nUse 'Export inventory to files' to keep the data." % msg))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_elevate(self):
+        try:
+            self._read_vars()
+            self.ctl.save_settings()      # keep what was typed; the new window reads sensor.conf
+        except Exception:  # noqa
+            pass
+        try:
+            import ctypes
+            frozen = getattr(sys, "frozen", False)
+            prog = sys.executable
+            params = "" if frozen else '"%s"' % os.path.abspath(__file__)
+            if ctypes.windll.shell32.ShellExecuteW(None, "runas", prog, params, _app_dir(), 1) > 32:
+                self.root.destroy()
+                return
+        except Exception:  # noqa
+            pass
+        messagebox.showinfo("OT Sense", "Please close this program, right-click OTSense-Sensor.exe and choose 'Run as administrator'.")
+
+    def on_close(self):
+        if self.ctl.state == "running":
+            if not messagebox.askyesno("OT Sense", "The sensor is running. Stop it and close?"):
+                return
+            self._read_vars()
+            self.ctl.stop("stopped: window closed")
+            self.closing = True
+            return
+        if self.ctl.state == "stopping":
+            self.closing = True
+            return
+        if self.ctl.has_data() and not self.ctl.exported and self.ctl.cfg["send"] is False:
+            if messagebox.askyesno("OT Sense", "The results have not been exported. Export them before closing?"):
+                if not self.on_export():
+                    return
+        self.root.destroy()
+
+    # ------------------------------------------------------------ refresh loop (twice a second)
+    def _tick(self):
+        try:
+            self._refresh()
+        except Exception as e:  # noqa
+            self.status_line.set("display error: %s" % e)
+        self.root.after(500, self._tick)
+
+    def _refresh(self):
+        ctl = self.ctl
+        while self.ui_q:
+            self.ui_q.popleft()()
+        s = ctl.status()
+        st = s["state"]
+        run = st == "running"
+        # header
+        self.pill.configure(text={"idle": " STOPPED ", "running": " RUNNING ", "stopping": " STOPPING... "}[st],
+                            bg={"idle": "#33445a", "running": "#1b6b3a", "stopping": "#7a5a12"}[st])
+        self.lbl_site.configure(text="Site: %s    Scanning: %s%s" % (ctl.cfg["site"], s["mode"], " (set by central)" if s["central_scan"] else ""))
+        self.btn_start.configure(state="normal" if st == "idle" else "disabled")
+        self.btn_stop.configure(state="normal" if run else "disabled")
+        self.btn_scan.configure(state="normal" if (run and s["mode"] == "active" and s["scan"]["state"] != "running") else "disabled")
+        lock = "normal" if st == "idle" else "disabled"
+        for w in (self.rb_passive, self.rb_active, self.btn_refresh, self.sp_min):
+            w.configure(state=lock)
+        self.cb_adapter.configure(state="readonly" if st == "idle" else "disabled")
+        self.lbl_central.configure(text=("Central has set this site to %s" % s["central_scan"]) if s["central_scan"] else "")
+        if s["errors"]:
+            self.err_bar.configure(text="\u26A0  " + "  ".join(s["errors"]))
+            self.err_bar.pack(fill="x", before=self.nb) if not self.err_bar.winfo_ismapped() else None
+        elif self.err_bar.winfo_ismapped():
+            self.err_bar.pack_forget()
+        # tiles
+        sc = s["scan"]
+        self.t["packets"][0].set("{:,}".format(s["packets"]))
+        self.t["packets"][1].set("%s   (%s/s shown)" % (_fmt_dur(s["elapsed"]), ctl.PKT_RATE) if s["packets"] else _fmt_dur(s["elapsed"]) if s["elapsed"] else "")
+        self.t["devices"][0].set(str(s["devices"]))
+        self.t["devices"][1].set("%d alerts" % s["alerts"])
+        txt = {"not run": "Not run", "running": "Scanning...", "done": "Done", "error": "Failed", "cancelled": "Cancelled"}[sc["state"]]
+        if sc["state"] == "done":
+            txt = "Done - %d devices" % sc["found"]
+        elif sc["state"] == "not run" and run and s["mode"] == "passive":
+            txt = "Not run (passive)"
+        self.t["scan"][0].set(txt)
+        self.t["scan"][1].set(sc["subnet"] + ("   " + sc["method"] if sc["method"] and sc["state"] == "done" else ""))
+        if not s["server"]:
+            srv, sub, col = "Not set up", "results stay on this PC", C_MUTED
+        elif not s["send"]:
+            srv, sub, col = "Sending off", "", C_MUTED
+        elif s["push_ok"] is None:
+            srv, sub, col = "Waiting", "no data sent yet", C_MUTED
+        elif s["push_ok"]:
+            srv, sub, col = "Connected", "last sent %ss ago" % s["push_ago"], C_OK
+        else:
+            srv, sub, col = "Cannot reach", (s["push_error"] or "")[:60], C_BAD
+        self.t["server"][0].set(srv)
+        self.t["server"][2].configure(fg=col)
+        self.t["server"][1].set(sub)
+        # progress bar
+        if sc["state"] == "running":
+            self._bar(False, 100.0 * sc["done"] / sc["total"] if sc["total"] else 0)
+            self.bar_text.set("Device scan: %d of %d addresses asked on %s" % (sc["done"], sc["total"], sc["subnet"]))
+        elif run and s["minutes"]:
+            left = s["minutes"] * 60 - s["elapsed"]
+            self._bar(False, 100.0 * s["elapsed"] / (s["minutes"] * 60))
+            self.bar_text.set("Listening... %s left (stops by itself after %d min)%s" % (_fmt_dur(left), s["minutes"], "   |   device scan done: %d devices" % sc["found"] if sc["state"] == "done" else ""))
+        elif run:
+            self._bar(True)
+            self.bar_text.set("Listening... press Stop when you are done.%s" % ("   |   device scan done: %d devices" % sc["found"] if sc["state"] == "done" else ""))
+        elif st == "stopping":
+            self._bar(True)
+            self.bar_text.set("Stopping and sending the final results...")
+        else:
+            self._bar(False, 100 if sc["state"] == "done" else 0)
+            self.bar_text.set("Stopped. %d packets, %d devices.%s" % (s["packets"], s["devices"], "" if not ctl.has_data() else " Results are kept until you press Start again."))
+        # packets
+        if not self.b["pause"].get():
+            rows, self.pkt_last = ctl.packets_since(self.pkt_last)
+            f = self.v["filter"].get().strip().lower()
+            for r in rows:
+                if f and f not in " ".join(str(x) for x in r[:6]).lower():
+                    continue
+                self.tv_pk.insert("", "end", values=r[:6], tags=("ot",) if r[6] else ())
+            ch = self.tv_pk.get_children()
+            if len(ch) > 3000:
+                self.tv_pk.delete(*ch[:len(ch) - 3000])
+            if rows and self.b["autoscroll"].get():
+                self.tv_pk.yview_moveto(1.0)
+        self.lbl_pk.configure(text="%s packets seen, %s in the list%s" % ("{:,}".format(s["packets"]), "{:,}".format(s["listed"]),
+                                                                          ("  (list limited to %d/s on busy networks)" % ctl.PKT_RATE) if s["skipped"] else ""))
+        # devices
+        if ctl.devices_ver != self.dev_ver:
+            self.dev_ver = ctl.devices_ver
+            self.tv_dev.delete(*self.tv_dev.get_children())
+            for r in ctl.devices:
+                self.tv_dev.insert("", "end", values=r)
+            self.lbl_dev.configure(text="%d devices in the inventory (found by listening and/or by the device scan)." % len(ctl.devices))
+            self._scan_rows()
+        elif sc["state"] != getattr(self, "_last_scan_state", None):
+            self._scan_rows()
+        # scan tab texts
+        if sc["state"] == "running":
+            self.lbl_scan.configure(text="Device scan: running... %d of %d addresses" % (sc["done"], sc["total"]))
+            self.lbl_scan2.configure(text="Adapter %s, network %s" % (sc["adapter"], sc["subnet"]))
+        elif sc["state"] == "done":
+            self.lbl_scan.configure(text="Device scan: finished - %d devices found" % sc["found"])
+            self.lbl_scan2.configure(text="Network %s on %s. Method: %s. Takes %d s." % (sc["subnet"], sc["adapter"], sc["method"], sc["t1"] - sc["t0"]))
+        elif sc["state"] in ("error", "cancelled"):
+            self.lbl_scan.configure(text="Device scan: %s" % sc["state"])
+            self.lbl_scan2.configure(text=sc["error"])
+        # log
+        n = len(ctl.logs)
+        if n != self.log_n:
+            items = list(ctl.logs)[-200:] if n - self.log_n > 200 or n < self.log_n else list(ctl.logs)[self.log_n - n:]
+            self.txt_log.configure(state="normal")
+            for ts, m in items:
+                self.txt_log.insert("end", "[%s] %s\n" % (time.strftime("%H:%M:%S", time.localtime(ts)), m))
+            self.txt_log.see("end")
+            self.txt_log.configure(state="disabled")
+            self.log_n = n
+            if items:
+                self.status_line.set(items[-1][1])
+        # notices from the controller (e.g. "server not reachable - export?")
+        while ctl.notices:
+            nt = ctl.notices.popleft()
+            if nt["kind"] == "export":
+                if messagebox.askyesno("OT Sense", nt["text"]):
+                    self.on_export()
+            else:
+                messagebox.showerror("OT Sense", nt["text"])
+        if self.closing and st == "idle":
+            self.root.destroy()
+
+    def _scan_rows(self):
+        self._last_scan_state = self.ctl.scan["state"]
+        self.tv_scan.delete(*self.tv_scan.get_children())
+        for x in self.ctl.scan_list():
+            self.tv_scan.insert("", "end", values=(x["ip"], x["mac"] or "-", x["vendor"] or "-", x.get("name") or "-"))
+
+    def _bar(self, busy, value=0):
+        if busy:
+            if self.bar.cget("mode") != "indeterminate":
+                self.bar.configure(mode="indeterminate")
+                self.bar.start(25)
+        else:
+            if self.bar.cget("mode") == "indeterminate":
+                self.bar.stop()
+                self.bar.configure(mode="determinate")
+            self.bar["value"] = value
+
+
+def _hide_console():
+    """The exe may be built with a console. When it was started by a double-click, that black window is the only thing in it: hide it."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetConsoleWindow()
+        if h:
+            pl = (ctypes.c_uint * 4)()
+            if k.GetConsoleProcessList(pl, 4) <= 1:
+                ctypes.windll.user32.ShowWindow(h, 0)
+    except Exception:  # noqa
+        pass
+
+
+def run_gui(av=None):
+    """OTSense-Sensor.exe (no arguments) / OTSense-Sensor.exe gui"""
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+    try:
+        _load_tk()
+    except Exception as e:  # noqa
+        print("The window cannot open on this computer (%s). Using the text mode instead." % e)
+        return None
+    if os.name == "nt":
+        _hide_console()
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:  # noqa
+            pass
+    conf, path = {}, None
+    for p in _gui_conf_paths():
+        if os.path.exists(p):
+            try:
+                conf, path = _read_conf(p), p
+                break
+            except OSError:
+                continue
+    ctl = GuiController(path or _gui_conf_paths()[0], conf)
+    ctl.log("OT Sense sensor %s - window opened. %s" % (VERSION, ("settings from " + path) if path else "no sensor.conf found: type the server address and token on the Server tab"))
+    app = GuiApp(ctl)
+    app.root.mainloop()
+    return 0
+
+
 def _finish(an, args, quiet=False):
     snap = an.snapshot()
     paths = write_reports(snap, args.output)
@@ -4999,6 +6429,11 @@ def _finish(an, args, quiet=False):
 
 def main(argv=None):
     av = sys.argv[1:] if argv is None else list(argv)
+    if (getattr(sys, "frozen", False) and (not av or av[0].lower() == "gui")) or (av and av[0].lower() == "gui"):
+        rc = run_gui(av[1:])
+        if rc is not None:
+            return rc
+        return run_winapp(["run"])       # no window possible here (no Tk): old text mode
     if (getattr(sys, "frozen", False) and (not av or av[0].lower() in ("run", "service", "install", "uninstall", "ifaces"))) or (av and av[0] == "winapp"):
         return run_winapp(av[1:] if av and av[0] == "winapp" else av)
     ap = argparse.ArgumentParser(prog="otsense", description="Passive OT/IT asset discovery, DPI and threat detection")
